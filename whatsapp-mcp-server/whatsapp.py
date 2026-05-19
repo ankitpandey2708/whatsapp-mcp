@@ -33,7 +33,7 @@ MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 WHATSAPP_STORE_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
 
-# ── Shared DB helpers (Fix #4, #5) ───────────────────────────────────────────
+# ── Shared DB helpers ─────────────────────────────────────────────────────────
 
 @contextmanager
 def open_db(path: str):
@@ -48,7 +48,16 @@ def make_placeholders(items: List) -> str:
     """Return a comma-separated '?,?,?' string for SQL IN clauses."""
     return ','.join('?' * len(items))
 
-# ── Contact name helper (Fix #3) ─────────────────────────────────────────────
+# Correlated subquery that reliably picks the single latest message per chat.
+# Avoids the timestamp-equality JOIN that breaks when two messages share a timestamp.
+# Requires the chats table to be aliased as 'c' in the outer query.
+_LAST_MSG_JOIN = """
+    LEFT JOIN messages m ON m.rowid = (
+        SELECT rowid FROM messages WHERE chat_jid = c.jid ORDER BY timestamp DESC LIMIT 1
+    )
+"""
+
+# ── Contact name helper ───────────────────────────────────────────────────────
 
 def get_contact_name_from_jid(jid: str, conn) -> Optional[str]:
     """Look up the best display name for a phone JID in whatsmeow_contacts."""
@@ -83,6 +92,7 @@ def phone_to_lid(phone: str) -> Optional[str]:
         return None
 
 def resolve_jid(jid: str) -> str:
+    """Resolve a LID JID to its phone-based JID; pass through everything else."""
     if jid.endswith('@lid'):
         phone = lid_to_phone(jid)
         if phone:
@@ -167,7 +177,7 @@ class MessageContext:
     before: List[Message]
     after: List[Message]
 
-# ── Row parsers (Fix #1, #2) ──────────────────────────────────────────────────
+# ── Row parsers ───────────────────────────────────────────────────────────────
 
 def parse_message_row(msg, media_type_col: int = 7) -> Message:
     """Parse a standard 8-column message SELECT row into a Message object."""
@@ -193,7 +203,7 @@ def parse_chat_row(chat_data, store_conn=None) -> Chat:
         last_is_from_me=chat_data[5],
     )
 
-# ── API helper (Fix #6) ───────────────────────────────────────────────────────
+# ── API helpers ───────────────────────────────────────────────────────────────
 
 def _validate_media_send(recipient: str, media_path: str) -> Optional[Tuple[bool, str]]:
     """Return an error tuple if inputs are invalid, else None."""
@@ -205,20 +215,26 @@ def _validate_media_send(recipient: str, media_path: str) -> Optional[Tuple[bool
         return False, f"Media file not found: {media_path}"
     return None
 
-def _post_to_api(url: str, payload: dict) -> Tuple[bool, str]:
-    """POST to the bridge REST API and return (success, message)."""
+def _call_api(url: str, payload: dict) -> Tuple[Optional[dict], str]:
+    """POST to the bridge REST API. Returns (parsed_json, error_message)."""
     try:
         response = requests.post(url, json=payload)
         if response.status_code == 200:
-            result = response.json()
-            return result.get("success", False), result.get("message", "Unknown response")
-        return False, f"Error: HTTP {response.status_code} - {response.text}"
+            return response.json(), ""
+        return None, f"Error: HTTP {response.status_code} - {response.text}"
     except requests.RequestException as e:
-        return False, f"Request error: {str(e)}"
+        return None, f"Request error: {str(e)}"
     except json.JSONDecodeError:
-        return False, f"Error parsing response: {response.text}"
+        return None, f"Error parsing response: {response.text}"
     except Exception as e:
-        return False, f"Unexpected error: {str(e)}"
+        return None, f"Unexpected error: {str(e)}"
+
+def _post_to_api(url: str, payload: dict) -> Tuple[bool, str]:
+    """POST to the bridge REST API and return (success, message)."""
+    result, err = _call_api(url, payload)
+    if result is None:
+        return False, err
+    return result.get("success", False), result.get("message", "Unknown response")
 
 # ── Sender name resolution ────────────────────────────────────────────────────
 
@@ -235,18 +251,18 @@ def get_sender_name(sender_jid: str) -> str:
         if lid_from_phone:
             candidates.extend([f"{lid_from_phone}@lid", f"{lid_from_phone}@s.whatsapp.net"])
 
-        with open_db(MESSAGES_DB_PATH) as conn:
-            for jid in candidates:
-                row = conn.execute("SELECT name FROM chats WHERE jid = ? LIMIT 1", (jid,)).fetchone()
-                if row and row[0] and not row[0].isdigit():
-                    return row[0]
-
         phone_candidates = [f"{raw}@s.whatsapp.net"]
         if phone_from_lid:
             phone_candidates.append(f"{phone_from_lid}@s.whatsapp.net")
-        with open_db(WHATSAPP_STORE_DB_PATH) as conn:
+
+        # Fix #9: open both DBs together instead of two sequential connections
+        with open_db(MESSAGES_DB_PATH) as msg_conn, open_db(WHATSAPP_STORE_DB_PATH) as store_conn:
+            for jid in candidates:
+                row = msg_conn.execute("SELECT name FROM chats WHERE jid = ? LIMIT 1", (jid,)).fetchone()
+                if row and row[0] and not row[0].isdigit():
+                    return row[0]
             for jid in phone_candidates:
-                name = get_contact_name_from_jid(jid, conn)
+                name = get_contact_name_from_jid(jid, store_conn)
                 if name:
                     return name
 
@@ -298,7 +314,7 @@ def list_messages(
     include_context: bool = True,
     context_before: int = 1,
     context_after: int = 1
-) -> List[Message]:
+) -> str:  # Fix #1: was annotated List[Message] but always returned str
     """Get messages matching the specified criteria with optional context."""
     try:
         with open_db(MESSAGES_DB_PATH) as conn:
@@ -354,23 +370,37 @@ def list_messages(
             cursor = conn.execute(" ".join(query_parts), tuple(params))
             result = [parse_message_row(row) for row in cursor.fetchall()]
 
-        if include_context and result:
-            messages_with_context = []
-            for msg in result:
-                ctx = get_message_context(msg.id, context_before, context_after)
-                messages_with_context.extend(ctx.before)
-                messages_with_context.append(ctx.message)
-                messages_with_context.extend(ctx.after)
-            return format_messages_list(messages_with_context, show_chat_info=True)
+            # Fix #8: batch all context queries inside the same connection (was N+1 open_db calls)
+            if include_context and result:
+                messages_with_context = []
+                for msg in result:
+                    before_rows = conn.execute("""
+                        SELECT messages.timestamp, messages.sender, chats.name, messages.content,
+                               messages.is_from_me, chats.jid, messages.id, messages.media_type
+                        FROM messages JOIN chats ON messages.chat_jid = chats.jid
+                        WHERE messages.chat_jid = ? AND messages.timestamp < ?
+                        ORDER BY messages.timestamp DESC LIMIT ?
+                    """, (msg.chat_jid, msg.timestamp, context_before)).fetchall()
+                    after_rows = conn.execute("""
+                        SELECT messages.timestamp, messages.sender, chats.name, messages.content,
+                               messages.is_from_me, chats.jid, messages.id, messages.media_type
+                        FROM messages JOIN chats ON messages.chat_jid = chats.jid
+                        WHERE messages.chat_jid = ? AND messages.timestamp > ?
+                        ORDER BY messages.timestamp ASC LIMIT ?
+                    """, (msg.chat_jid, msg.timestamp, context_after)).fetchall()
+                    messages_with_context.extend(parse_message_row(r) for r in reversed(before_rows))
+                    messages_with_context.append(msg)
+                    messages_with_context.extend(parse_message_row(r) for r in after_rows)
+                return format_messages_list(messages_with_context, show_chat_info=True)
 
-        return format_messages_list(result, show_chat_info=True)
+            return format_messages_list(result, show_chat_info=True)
 
     except sqlite3.Error as e:
         print(f"Database error: {e}", file=sys.stderr)
-        return []
+        return ""  # Fix #1: was returning [] (wrong type)
 
 
-def get_message_context(message_id: str, before: int = 5, after: int = 5) -> MessageContext:
+def get_message_context(message_id: str, before: int = 5, after: int = 5) -> Optional[MessageContext]:
     """Get context around a specific message."""
     try:
         with open_db(MESSAGES_DB_PATH) as conn:
@@ -412,7 +442,7 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> Mes
 
     except sqlite3.Error as e:
         print(f"Database error: {e}", file=sys.stderr)
-        raise
+        return None  # Fix #7: was re-raising; now consistent with every other function
 
 
 def list_chats(
@@ -426,25 +456,22 @@ def list_chats(
     try:
         with open_db(MESSAGES_DB_PATH) as conn, open_db(WHATSAPP_STORE_DB_PATH) as store_conn:
             query_parts = ["""
-                SELECT chats.jid, chats.name, chats.last_message_time,
-                       messages.content as last_message,
-                       messages.sender as last_sender,
-                       messages.is_from_me as last_is_from_me
-                FROM chats
+                SELECT c.jid, c.name, c.last_message_time,
+                       m.content as last_message,
+                       m.sender as last_sender,
+                       m.is_from_me as last_is_from_me
+                FROM chats c
             """]
             if include_last_message:
-                query_parts.append("""
-                    LEFT JOIN messages ON chats.jid = messages.chat_jid
-                    AND chats.last_message_time = messages.timestamp
-                """)
+                query_parts.append(_LAST_MSG_JOIN)  # Fix #5: correlated subquery; was timestamp-equality JOIN
             where_clauses, params = [], []
             if query:
-                where_clauses.append("(LOWER(chats.name) LIKE LOWER(?) OR chats.jid LIKE ?)")
+                where_clauses.append("(LOWER(c.name) LIKE LOWER(?) OR c.jid LIKE ?)")
                 params.extend([f"%{query}%", f"%{query}%"])
             if where_clauses:
                 query_parts.append("WHERE " + " AND ".join(where_clauses))
 
-            order_by = "chats.last_message_time DESC" if sort_by == "last_active" else "chats.name"
+            order_by = "c.last_message_time DESC" if sort_by == "last_active" else "c.name"
             query_parts.append(f"ORDER BY {order_by} LIMIT ? OFFSET ?")
             params.extend([limit, page * limit])
 
@@ -473,7 +500,9 @@ def search_contacts(query: str) -> List[Contact]:
                 ORDER BY name LIMIT 50
             """, (pattern, pattern, pattern, pattern)).fetchall()
             for jid, name in rows:
-                seen[jid] = Contact(phone_number=jid.split('@')[0], name=name, jid=jid)
+                # Fix #4: resolve LID JIDs to real phone numbers instead of exposing raw LID
+                phone = (lid_to_phone(jid) or jid.split('@')[0]) if jid.endswith('@lid') else jid.split('@')[0]
+                seen[jid] = Contact(phone_number=phone, name=name, jid=jid)
     except sqlite3.Error as e:
         print(f"whatsapp.db search error: {e}", file=sys.stderr)
 
@@ -486,10 +515,11 @@ def search_contacts(query: str) -> List[Contact]:
                 ORDER BY name, jid LIMIT 50
             """, (pattern, pattern)).fetchall()
             for jid, name in rows:
+                phone = (lid_to_phone(jid) or jid.split('@')[0]) if jid.endswith('@lid') else jid.split('@')[0]
                 if jid not in seen:
-                    seen[jid] = Contact(phone_number=jid.split('@')[0], name=name, jid=jid)
+                    seen[jid] = Contact(phone_number=phone, name=name, jid=jid)
                 elif name and not seen[jid].name:
-                    seen[jid] = Contact(phone_number=jid.split('@')[0], name=name, jid=jid)
+                    seen[jid] = Contact(phone_number=phone, name=name, jid=jid)
     except sqlite3.Error as e:
         print(f"messages.db search error: {e}", file=sys.stderr)
 
@@ -499,16 +529,21 @@ def search_contacts(query: str) -> List[Contact]:
 def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
     """Get all chats involving the contact."""
     try:
-        jids = get_chat_jids_for_phone(jid)
+        # Fix #3: was get_chat_jids_for_phone which assumes phone input and breaks on LID JIDs
+        jids = expand_chat_jid(jid)
         ph = make_placeholders(jids)
         with open_db(MESSAGES_DB_PATH) as conn, open_db(WHATSAPP_STORE_DB_PATH) as store_conn:
             rows = conn.execute(f"""
-                SELECT DISTINCT c.jid, c.name, c.last_message_time,
+                SELECT c.jid, c.name, c.last_message_time,
                        m.content as last_message, m.sender as last_sender,
                        m.is_from_me as last_is_from_me
                 FROM chats c
-                JOIN messages m ON c.jid = m.chat_jid
-                WHERE m.sender IN ({ph}) OR c.jid IN ({ph})
+                {_LAST_MSG_JOIN}
+                WHERE c.jid IN (
+                    SELECT DISTINCT chat_jid FROM messages WHERE sender IN ({ph})
+                    UNION
+                    SELECT jid FROM chats WHERE jid IN ({ph})
+                )
                 ORDER BY c.last_message_time DESC
                 LIMIT ? OFFSET ?
             """, jids + jids + [limit, page * limit]).fetchall()
@@ -555,7 +590,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
             FROM chats c
         """
         if include_last_message:
-            query += " LEFT JOIN messages m ON c.jid = m.chat_jid AND c.last_message_time = m.timestamp"
+            query += _LAST_MSG_JOIN  # Fix #5: correlated subquery; was timestamp-equality JOIN
         query += f" WHERE c.jid IN ({ph})"
 
         with open_db(MESSAGES_DB_PATH) as conn:
@@ -581,8 +616,7 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
                        m.content as last_message, m.sender as last_sender,
                        m.is_from_me as last_is_from_me
                 FROM chats c
-                LEFT JOIN messages m ON c.jid = m.chat_jid
-                    AND c.last_message_time = m.timestamp
+                {_LAST_MSG_JOIN}
                 WHERE c.jid IN ({ph})
                 LIMIT 1
             """, jids).fetchone()
@@ -601,13 +635,14 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
 def send_message(recipient: str, message: str) -> Tuple[bool, str]:
     if not recipient:
         return False, "Recipient must be provided"
-    return _post_to_api(f"{WHATSAPP_API_BASE_URL}/send", {"recipient": recipient, "message": message})
+    # Fix #2: resolve LID JIDs before sending — Go bridge doesn't handle @lid addresses
+    return _post_to_api(f"{WHATSAPP_API_BASE_URL}/send", {"recipient": resolve_jid(recipient), "message": message})
 
 
 def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
     if err := _validate_media_send(recipient, media_path):
         return err
-    return _post_to_api(f"{WHATSAPP_API_BASE_URL}/send", {"recipient": recipient, "media_path": media_path})
+    return _post_to_api(f"{WHATSAPP_API_BASE_URL}/send", {"recipient": resolve_jid(recipient), "media_path": media_path})
 
 
 def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
@@ -618,27 +653,19 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
             media_path = audio.convert_to_opus_ogg_temp(media_path)
         except Exception as e:
             return False, f"Error converting file to opus ogg. You likely need to install ffmpeg: {str(e)}"
-    return _post_to_api(f"{WHATSAPP_API_BASE_URL}/send", {"recipient": recipient, "media_path": media_path})
+    return _post_to_api(f"{WHATSAPP_API_BASE_URL}/send", {"recipient": resolve_jid(recipient), "media_path": media_path})
 
 
 def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     """Download media from a message and return the local file path."""
-    try:
-        url = f"{WHATSAPP_API_BASE_URL}/download"
-        response = requests.post(url, json={"message_id": message_id, "chat_jid": chat_jid})
-        if response.status_code == 200:
-            result = response.json()
-            if result.get("success", False):
-                path = result.get("path")
-                print(f"Media downloaded successfully: {path}", file=sys.stderr)
-                return path
-            print(f"Download failed: {result.get('message', 'Unknown error')}", file=sys.stderr)
-        else:
-            print(f"Error: HTTP {response.status_code} - {response.text}", file=sys.stderr)
-    except requests.RequestException as e:
-        print(f"Request error: {str(e)}", file=sys.stderr)
-    except json.JSONDecodeError:
-        print(f"Error parsing response: {response.text}", file=sys.stderr)
-    except Exception as e:
-        print(f"Unexpected error: {str(e)}", file=sys.stderr)
+    # Fix #6: reuse _call_api instead of duplicating the HTTP error-handling ladder
+    result, err = _call_api(f"{WHATSAPP_API_BASE_URL}/download", {"message_id": message_id, "chat_jid": chat_jid})
+    if result is None:
+        print(err, file=sys.stderr)
+        return None
+    if result.get("success"):
+        path = result.get("path")
+        print(f"Media downloaded successfully: {path}", file=sys.stderr)
+        return path
+    print(f"Download failed: {result.get('message', 'Unknown error')}", file=sys.stderr)
     return None
