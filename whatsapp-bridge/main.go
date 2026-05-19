@@ -14,16 +14,18 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 	"github.com/mdp/qrterminal"
 
 	"bytes"
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -54,7 +56,7 @@ func NewMessageStore() (*MessageStore, error) {
 	}
 
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	db, err := sql.Open("sqlite", "file:store/messages.db?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -414,8 +416,14 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	chatJID := msg.Info.Chat.String()
 	sender := msg.Info.Sender.User
 
+	// Use PushName (WhatsApp display name) as the name hint; fall back to sender number
+	nameHint := msg.Info.PushName
+	if nameHint == "" {
+		nameHint = sender
+	}
+
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
-	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
+	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, nameHint, logger)
 
 	// Update chat in database with the message timestamp (keeps last message time updated)
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
@@ -460,12 +468,18 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		if msg.Info.IsFromMe {
 			direction = "→"
 		}
+		displaySender := name
+		if displaySender == "" || displaySender == sender {
+			displaySender = sender
+		} else {
+			displaySender = fmt.Sprintf("%s (%s)", name, sender)
+		}
 
 		// Log based on message type
 		if mediaType != "" {
-			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
+			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, displaySender, mediaType, filename, content)
 		} else if content != "" {
-			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
+			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, displaySender, content)
 		}
 	}
 }
@@ -641,7 +655,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -800,14 +814,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite", "file:store/whatsapp.db?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -826,6 +840,16 @@ func main() {
 		return
 	}
 
+	// Fetch and set the latest WhatsApp client version to avoid "Client outdated" errors
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+	latestVer, err := whatsmeow.GetLatestVersion(context.Background(), httpClient)
+	if err != nil {
+		logger.Warnf("Failed to fetch latest WhatsApp version: %v (using bundled default)", err)
+	} else {
+		logger.Infof("Updating WhatsApp client version to %s", latestVer)
+		store.SetWAVersion(*latestVer)
+	}
+
 	// Initialize message store
 	messageStore, err := NewMessageStore()
 	if err != nil {
@@ -834,55 +858,73 @@ func main() {
 	}
 	defer messageStore.Close()
 
+	// doQRLogin disconnects (if needed), clears the session, and runs the QR pairing flow.
+	var reloginInProgress atomic.Bool
+	doQRLogin := func() error {
+		client.Disconnect()
+		if client.Store.ID != nil {
+			if err := client.Store.Delete(context.Background()); err != nil {
+				logger.Warnf("Failed to delete stale session: %v", err)
+			}
+		}
+		qrChan, err := client.GetQRChannel(context.Background())
+		if err != nil {
+			return fmt.Errorf("failed to get QR channel: %w", err)
+		}
+		if err := client.Connect(); err != nil {
+			return err
+		}
+		fmt.Println("\nScan this QR code with your WhatsApp app:")
+		timeout := time.After(3 * time.Minute)
+		for {
+			select {
+			case evt, ok := <-qrChan:
+				if !ok {
+					return fmt.Errorf("QR channel closed unexpectedly")
+				}
+				if evt.Event == "code" {
+					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				} else if evt.Event == "success" {
+					fmt.Println("\nSuccessfully connected and authenticated!")
+					return nil
+				}
+			case <-timeout:
+				return fmt.Errorf("timeout waiting for QR code scan")
+			}
+		}
+	}
+
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Message:
-			// Process regular messages
 			handleMessage(client, messageStore, v, logger)
 
 		case *events.HistorySync:
-			// Process history sync events
 			handleHistorySync(client, messageStore, v, logger)
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
 
 		case *events.LoggedOut:
-			logger.Warnf("Device logged out, please scan QR code to log in again")
+			logger.Warnf("Device logged out, re-initiating QR login...")
+			go func() {
+				if !reloginInProgress.CompareAndSwap(false, true) {
+					logger.Warnf("Re-login already in progress, skipping")
+					return
+				}
+				defer reloginInProgress.Store(false)
+				if err := doQRLogin(); err != nil {
+					logger.Errorf("Re-login failed: %v", err)
+				}
+			}()
 		}
 	})
 
-	// Create channel to track connection success
-	connected := make(chan bool, 1)
-
 	// Connect to WhatsApp
 	if client.Store.ID == nil {
-		// No ID stored, this is a new client, need to pair with phone
-		qrChan, _ := client.GetQRChannel(context.Background())
-		err = client.Connect()
-		if err != nil {
+		if err := doQRLogin(); err != nil {
 			logger.Errorf("Failed to connect: %v", err)
-			return
-		}
-
-		// Print QR code for pairing with phone
-		for evt := range qrChan {
-			if evt.Event == "code" {
-				fmt.Println("\nScan this QR code with your WhatsApp app:")
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-			} else if evt.Event == "success" {
-				connected <- true
-				break
-			}
-		}
-
-		// Wait for connection
-		select {
-		case <-connected:
-			fmt.Println("\nSuccessfully connected and authenticated!")
-		case <-time.After(3 * time.Minute):
-			logger.Errorf("Timeout waiting for QR code scan")
 			return
 		}
 	} else {
@@ -892,7 +934,6 @@ func main() {
 			logger.Errorf("Failed to connect: %v", err)
 			return
 		}
-		connected <- true
 	}
 
 	// Wait a moment for connection to stabilize
@@ -924,11 +965,20 @@ func main() {
 
 // GetChatName determines the appropriate name for a chat based on JID and other info
 func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
-	// First, check if chat already exists in database with a name
+	// Check if chat already exists in database with a name
 	var existingName string
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
-	if err == nil && existingName != "" {
-		// Chat exists with a name, use that
+	isPhoneNumberOnly := func(s string) bool {
+		for _, c := range s {
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+		return len(s) > 0
+	}
+	// Return cached name only if it looks like a real name (not just a phone number)
+	// and we don't have a better hint coming in
+	if err == nil && existingName != "" && !isPhoneNumberOnly(existingName) {
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
 		return existingName
 	}
@@ -973,7 +1023,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1038,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
