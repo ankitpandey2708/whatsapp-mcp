@@ -638,8 +638,10 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
-// Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+// Start a REST API server to expose the WhatsApp client functionality.
+// getClient is called on every request so it always uses the current client,
+// even after a client swap triggered by a forced device removal.
+func startRESTServer(getClient func() *whatsmeow.Client, messageStore *MessageStore, port int) {
 	// Handler for sending messages
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
@@ -669,6 +671,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
+		client := getClient()
 		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
@@ -708,6 +711,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		}
 
 		// Download the media
+		client := getClient()
 		success, mediaType, filename, path, err := downloadMedia(client, messageStore, req.MessageID, req.ChatJID)
 
 		// Set response headers
@@ -807,21 +811,92 @@ func main() {
 	}
 	defer messageStore.Close()
 
-	// doQRLogin disconnects (if needed), clears the session, and runs the QR pairing flow.
+	// activeClient holds the live whatsmeow client. Stored atomically so the
+	// REST server and event handlers always read the current client, even after
+	// a forced device removal triggers a client swap.
+	var activeClient atomic.Pointer[whatsmeow.Client]
+	activeClient.Store(client)
+	getClient := func() *whatsmeow.Client { return activeClient.Load() }
+
+	// doQRLogin and registerHandlers call each other, so declare before assigning.
 	var reloginInProgress atomic.Bool
-	doQRLogin := func() error {
-		client.Disconnect()
-		if client.Store.ID != nil {
-			if err := client.Store.Delete(context.Background()); err != nil {
-				logger.Warnf("Failed to delete stale session: %v", err)
+	var doQRLogin func() error
+	var registerHandlers func(*whatsmeow.Client)
+
+	// registerHandlers attaches all event handlers to c.
+	// Called at startup and again whenever a fresh client is provisioned.
+	registerHandlers = func(c *whatsmeow.Client) {
+		c.AddEventHandler(func(evt interface{}) {
+			switch v := evt.(type) {
+			case *events.Message:
+				handleMessage(getClient(), messageStore, v, logger)
+
+			case *events.HistorySync:
+				handleHistorySync(getClient(), messageStore, v, logger)
+
+			case *events.Connected:
+				logger.Infof("Connected to WhatsApp")
+
+			case *events.LoggedOut:
+				logger.Warnf("Device logged out, re-initiating QR login...")
+				go func() {
+					if !reloginInProgress.CompareAndSwap(false, true) {
+						logger.Warnf("Re-login already in progress, skipping")
+						return
+					}
+					defer reloginInProgress.Store(false)
+					if err := doQRLogin(); err != nil {
+						logger.Errorf("Re-login failed: %v", err)
+					}
+				}()
 			}
+		})
+	}
+
+	// doQRLogin disconnects (if needed), clears the session, and runs the QR
+	// pairing flow. When WhatsApp forcibly removes the device, whatsmeow marks
+	// the client permanently deleted before firing LoggedOut. In that case a
+	// fresh device + client are provisioned and swapped in so the REST server
+	// and future events use the new client automatically.
+	doQRLogin = func() error {
+		c := getClient()
+		c.Disconnect()
+
+		// When WhatsApp forcibly removes a device, whatsmeow calls Store.Delete()
+		// internally BEFORE firing LoggedOut. This sets Store.ID = nil and marks
+		// the client as permanently deleted. Either path below indicates the old
+		// client is broken and must be replaced before calling GetQRChannel/Connect.
+		needFreshClient := false
+		if c.Store.ID != nil {
+			if err := c.Store.Delete(context.Background()); err != nil {
+				logger.Infof("Session already removed by server (%v); provisioning fresh device...", err)
+				needFreshClient = true
+			}
+		} else {
+			// Store.ID is nil — whatsmeow already deleted the device before firing
+			// LoggedOut. The client's isDeleted flag is set; any Connect() call will
+			// fail with "invalid use of deleted device".
+			logger.Infof("Device already removed by server (Store.ID nil); provisioning fresh device...")
+			needFreshClient = true
 		}
-		qrChan, err := client.GetQRChannel(context.Background())
+
+		if needFreshClient {
+			newDevice := container.NewDevice()
+			newClient := whatsmeow.NewClient(newDevice, logger)
+			if newClient == nil {
+				return fmt.Errorf("failed to create new WhatsApp client after forced removal")
+			}
+			activeClient.Store(newClient)
+			registerHandlers(newClient)
+			c = newClient
+		}
+
+		qrChan, err := c.GetQRChannel(context.Background())
 		if err != nil {
 			return fmt.Errorf("failed to get QR channel: %w", err)
 		}
-		if err := client.Connect(); err != nil {
-			return err
+		if err := c.Connect(); err != nil {
+			return fmt.Errorf("failed to connect: %w", err)
 		}
 		fmt.Println("\nScan this QR code with your WhatsApp app:")
 		timeout := time.After(3 * time.Minute)
@@ -843,32 +918,8 @@ func main() {
 		}
 	}
 
-	// Setup event handling for messages and history sync
-	client.AddEventHandler(func(evt interface{}) {
-		switch v := evt.(type) {
-		case *events.Message:
-			handleMessage(client, messageStore, v, logger)
-
-		case *events.HistorySync:
-			handleHistorySync(client, messageStore, v, logger)
-
-		case *events.Connected:
-			logger.Infof("Connected to WhatsApp")
-
-		case *events.LoggedOut:
-			logger.Warnf("Device logged out, re-initiating QR login...")
-			go func() {
-				if !reloginInProgress.CompareAndSwap(false, true) {
-					logger.Warnf("Re-login already in progress, skipping")
-					return
-				}
-				defer reloginInProgress.Store(false)
-				if err := doQRLogin(); err != nil {
-					logger.Errorf("Re-login failed: %v", err)
-				}
-			}()
-		}
-	})
+	// Register handlers on the initial client.
+	registerHandlers(client)
 
 	// Connect to WhatsApp
 	if client.Store.ID == nil {
@@ -877,7 +928,6 @@ func main() {
 			return
 		}
 	} else {
-		// Already logged in, just connect
 		err = client.Connect()
 		if err != nil {
 			logger.Errorf("Failed to connect: %v", err)
@@ -888,15 +938,15 @@ func main() {
 	// Wait a moment for connection to stabilize
 	time.Sleep(2 * time.Second)
 
-	if !client.IsConnected() {
+	if !getClient().IsConnected() {
 		logger.Errorf("Failed to establish stable connection")
 		return
 	}
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
-	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	// Pass getClient so handlers always resolve the live client.
+	startRESTServer(getClient, messageStore, 8080)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
@@ -904,12 +954,10 @@ func main() {
 
 	fmt.Println("REST server is running. Press Ctrl+C to disconnect and exit.")
 
-	// Wait for termination signal
 	<-exitChan
 
 	fmt.Println("Disconnecting...")
-	// Disconnect client
-	client.Disconnect()
+	getClient().Disconnect()
 }
 
 // GetChatName determines the appropriate name for a chat based on JID and other info
