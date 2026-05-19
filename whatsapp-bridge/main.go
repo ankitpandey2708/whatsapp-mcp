@@ -243,46 +243,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 		// Determine media type and mime type based on file extension
 		fileExt := strings.ToLower(mediaPath[strings.LastIndex(mediaPath, ".")+1:])
-		var mediaType whatsmeow.MediaType
-		var mimeType string
-
-		// Handle different media types
-		switch fileExt {
-		// Image types
-		case "jpg", "jpeg":
-			mediaType = whatsmeow.MediaImage
-			mimeType = "image/jpeg"
-		case "png":
-			mediaType = whatsmeow.MediaImage
-			mimeType = "image/png"
-		case "gif":
-			mediaType = whatsmeow.MediaImage
-			mimeType = "image/gif"
-		case "webp":
-			mediaType = whatsmeow.MediaImage
-			mimeType = "image/webp"
-
-		// Audio types
-		case "ogg":
-			mediaType = whatsmeow.MediaAudio
-			mimeType = "audio/ogg; codecs=opus"
-
-		// Video types
-		case "mp4":
-			mediaType = whatsmeow.MediaVideo
-			mimeType = "video/mp4"
-		case "avi":
-			mediaType = whatsmeow.MediaVideo
-			mimeType = "video/avi"
-		case "mov":
-			mediaType = whatsmeow.MediaVideo
-			mimeType = "video/quicktime"
-
-		// Document types (for any other file type)
-		default:
-			mediaType = whatsmeow.MediaDocument
-			mimeType = "application/octet-stream"
-		}
+		mediaType, mimeType := extToMediaType(fileExt)
 
 		// Upload media to WhatsApp servers
 		resp, err := client.Upload(context.Background(), mediaData, mediaType)
@@ -379,21 +340,23 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 		return "", "", "", nil, nil, nil, 0
 	}
 
+	ts := time.Now().Format("20060102_150405")
+
 	// Check for image message
 	if img := msg.GetImageMessage(); img != nil {
-		return "image", "image_" + time.Now().Format("20060102_150405") + ".jpg",
+		return "image", "image_" + ts + ".jpg",
 			img.GetURL(), img.GetMediaKey(), img.GetFileSHA256(), img.GetFileEncSHA256(), img.GetFileLength()
 	}
 
 	// Check for video message
 	if vid := msg.GetVideoMessage(); vid != nil {
-		return "video", "video_" + time.Now().Format("20060102_150405") + ".mp4",
+		return "video", "video_" + ts + ".mp4",
 			vid.GetURL(), vid.GetMediaKey(), vid.GetFileSHA256(), vid.GetFileEncSHA256(), vid.GetFileLength()
 	}
 
 	// Check for audio message
 	if aud := msg.GetAudioMessage(); aud != nil {
-		return "audio", "audio_" + time.Now().Format("20060102_150405") + ".ogg",
+		return "audio", "audio_" + ts + ".ogg",
 			aud.GetURL(), aud.GetMediaKey(), aud.GetFileSHA256(), aud.GetFileEncSHA256(), aud.GetFileLength()
 	}
 
@@ -401,7 +364,7 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 	if doc := msg.GetDocumentMessage(); doc != nil {
 		filename := doc.GetFileName()
 		if filename == "" {
-			filename = "document_" + time.Now().Format("20060102_150405")
+			filename = "document_" + ts
 		}
 		return "document", filename,
 			doc.GetURL(), doc.GetMediaKey(), doc.GetFileSHA256(), doc.GetFileEncSHA256(), doc.GetFileLength()
@@ -475,12 +438,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			displaySender = fmt.Sprintf("%s (%s)", name, sender)
 		}
 
-		// Log based on message type
-		if mediaType != "" {
-			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, displaySender, mediaType, filename, content)
-		} else if content != "" {
-			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, displaySender, content)
-		}
+		logMessage(timestamp, direction, displaySender, mediaType, filename, content)
 	}
 }
 
@@ -630,18 +588,9 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	directPath := extractDirectPathFromURL(url)
 
 	// Create a downloader that implements DownloadableMessage
-	var waMediaType whatsmeow.MediaType
-	switch mediaType {
-	case "image":
-		waMediaType = whatsmeow.MediaImage
-	case "video":
-		waMediaType = whatsmeow.MediaVideo
-	case "audio":
-		waMediaType = whatsmeow.MediaAudio
-	case "document":
-		waMediaType = whatsmeow.MediaDocument
-	default:
-		return false, "", "", "", fmt.Errorf("unsupported media type: %s", mediaType)
+	waMediaType, err := stringToMediaType(mediaType)
+	if err != nil {
+		return false, "", "", "", err
 	}
 
 	downloader := &MediaDownloader{
@@ -1182,12 +1131,11 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				} else {
 					syncedCount++
 					// Log successful message storage
+					ts := timestamp.Format("2006-01-02 15:04:05")
 					if mediaType != "" {
-						logger.Infof("Stored message: [%s] %s -> %s: [%s: %s] %s",
-							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, mediaType, filename, content)
+						logger.Infof("Stored message: [%s] %s -> %s: [%s: %s] %s", ts, sender, chatJID, mediaType, filename, content)
 					} else {
-						logger.Infof("Stored message: [%s] %s -> %s: %s",
-							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, content)
+						logger.Infof("Stored message: [%s] %s -> %s: %s", ts, sender, chatJID, content)
 					}
 				}
 			}
@@ -1338,6 +1286,55 @@ func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 		len(data), duration, len(waveform))
 
 	return duration, waveform, nil
+}
+
+// extToMediaType maps a file extension to a whatsmeow MediaType and MIME type.
+func extToMediaType(ext string) (whatsmeow.MediaType, string) {
+	switch ext {
+	case "jpg", "jpeg":
+		return whatsmeow.MediaImage, "image/jpeg"
+	case "png":
+		return whatsmeow.MediaImage, "image/png"
+	case "gif":
+		return whatsmeow.MediaImage, "image/gif"
+	case "webp":
+		return whatsmeow.MediaImage, "image/webp"
+	case "ogg":
+		return whatsmeow.MediaAudio, "audio/ogg; codecs=opus"
+	case "mp4":
+		return whatsmeow.MediaVideo, "video/mp4"
+	case "avi":
+		return whatsmeow.MediaVideo, "video/avi"
+	case "mov":
+		return whatsmeow.MediaVideo, "video/quicktime"
+	default:
+		return whatsmeow.MediaDocument, "application/octet-stream"
+	}
+}
+
+// stringToMediaType converts a media-type string (image/video/audio/document) to a whatsmeow.MediaType.
+func stringToMediaType(s string) (whatsmeow.MediaType, error) {
+	switch s {
+	case "image":
+		return whatsmeow.MediaImage, nil
+	case "video":
+		return whatsmeow.MediaVideo, nil
+	case "audio":
+		return whatsmeow.MediaAudio, nil
+	case "document":
+		return whatsmeow.MediaDocument, nil
+	default:
+		return "", fmt.Errorf("unsupported media type: %s", s)
+	}
+}
+
+// logMessage prints a single message line to stdout.
+func logMessage(timestamp, direction, displaySender, mediaType, filename, content string) {
+	if mediaType != "" {
+		fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, displaySender, mediaType, filename, content)
+	} else if content != "" {
+		fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, displaySender, content)
+	}
 }
 
 // min returns the smaller of x or y
